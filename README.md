@@ -34,7 +34,7 @@ python3 --version
 If your script file is named `flip_extra_flips_live.py`:
 
 ```bash
-python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep-per-page 0.1 --top 50 --out-dir ./out
+python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep-per-page 0.1 --top 5000 --out-dir ./out
 ```
 
 * `--epoch 0` means: automatically use the current epoch from the API.
@@ -56,13 +56,13 @@ After running, you get:
 This makes extra API calls, one per author over threshold:
 
 ```bash
-python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep-per-page 0.1 --top 50 --out-dir ./out --fetch-stake
+python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep-per-page 0.1 --top 5000 --out-dir ./out --fetch-stake
 ```
 
 Hint: If you hit rate limits or it feels slow, increase sleep a bit:
 
 ```bash
-python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep-per-page 0.3 --top 50 --out-dir ./out --fetch-stake
+python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep-per-page 0.3 --top 5000 --out-dir ./out --fetch-stake
 ```
 
 ### Common flags

@@ -5,13 +5,16 @@ Live "extra flips" scan for the current epoch (before validation).
 Goal:
 - Count how many identities (authors) have published more than N flips (default N=3)
 - Compute total extra flips beyond N (sum(max(0, count - N)))
-- Optional: fetch stake for those authors (extra flips per stake), if you enable --fetch-stake
+- Optional: fetch stake information:
+  - --fetch-stake: fetch stake only for authors with extra flips (flipCount > threshold)
+  - --fetch-stake-all: fetch stake for ALL authors who submitted at least 1 flip (heavy)
 
 Endpoints used (Idena indexer API):
 - GET /Epoch/Last
 - GET /Epoch/{epoch}/Flips (paged)
+- GET /Address/{address} (best-effort) OR /Identity/{address} fallback (best-effort)
 
-No external dependencies (no requests). Uses only Python stdlib.
+No external dependencies (stdlib only).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 BASE_URL_DEFAULT = "https://api.idena.io/api"
@@ -56,21 +60,20 @@ class HttpClient:
         last_err: Optional[Exception] = None
         for attempt in range(1, self.retries + 1):
             try:
-                req = Request(url, headers={"Accept": "application/json"})
+                req = Request(url, headers={"Accept": "application/json", "User-Agent": "idena-extra-flips-live/1.1"})
                 with urlopen(req, timeout=self.timeout) as resp:
                     status = getattr(resp, "status", 200)
                     if status == 429:
                         time.sleep(self.backoff_sec * attempt)
                         continue
                     body = resp.read().decode("utf-8", errors="replace")
-                js = json.loads(body)
 
+                js = json.loads(body)
                 err = js.get("error")
                 if isinstance(err, dict) and err.get("message"):
                     raise RuntimeError(f"API error at {path}: {err.get('message')}")
-
                 return js
-            except Exception as e:
+            except (HTTPError, URLError, json.JSONDecodeError, RuntimeError) as e:
                 last_err = e
                 time.sleep(self.backoff_sec * attempt)
 
@@ -123,9 +126,8 @@ def safe_float(v: Any) -> float:
 
 
 def try_get_author(flip: Dict[str, Any]) -> str:
-    # tolerant to schema changes
     for k in ("author", "authorAddress", "address"):
-        a = (flip.get(k) or "")
+        a = flip.get(k)
         if isinstance(a, str) and a.startswith("0x") and len(a) == 42:
             return a.lower()
     return ""
@@ -136,25 +138,56 @@ def try_get_cid(flip: Dict[str, Any]) -> str:
     return c if isinstance(c, str) else ""
 
 
-def fetch_stake_for_address(api: HttpClient, address: str) -> Tuple[float, str]:
+def extract_stake_from_result(res: Any) -> Tuple[float, str]:
     """
-    Best-effort stake fetch.
-    If the indexer response schema changes, we keep it safe and return 0.0.
+    Try multiple known-ish shapes. Returns (stake, note).
     """
+    if not isinstance(res, dict):
+        return 0.0, "result_not_dict"
+
+    # common top-level keys
+    for k in ("stake", "Stake", "stakeBalance", "stakeAmount"):
+        if k in res:
+            return safe_float(res.get(k)), ""
+
+    # nested balance object
+    bal = res.get("balance")
+    if isinstance(bal, dict):
+        for k in ("stake", "Stake"):
+            if k in bal:
+                return safe_float(bal.get(k)), ""
+
+    # nested profile/state object
+    for k in ("profile", "state"):
+        obj = res.get(k)
+        if isinstance(obj, dict):
+            for kk in ("stake", "Stake"):
+                if kk in obj:
+                    return safe_float(obj.get(kk)), ""
+
+    return 0.0, "stake_not_found"
+
+
+def fetch_stake_for_address_best_effort(api: HttpClient, address: str) -> Tuple[float, str]:
+    """
+    Best-effort stake fetch with fallback endpoints.
+    Returns (stake, note).
+    """
+    # Try /Address/{addr}
     try:
         js = api.get_json(f"/Address/{address}")
-        res = js.get("result") or {}
-        # common possible keys
-        for k in ("stake", "Stake", "stakeBalance", "stakeAmount"):
-            if k in res:
-                return safe_float(res.get(k)), ""
-        # sometimes nested
-        if isinstance(res.get("balance"), dict):
-            b = res["balance"]
-            for k in ("stake", "Stake"):
-                if k in b:
-                    return safe_float(b.get(k)), ""
-        return 0.0, "stake_not_found"
+        stake, note = extract_stake_from_result(js.get("result"))
+        if stake > 0 or note != "stake_not_found":
+            return stake, note
+    except Exception as e:
+        # keep going, try fallback
+        pass
+
+    # Try /Identity/{addr} as fallback
+    try:
+        js = api.get_json(f"/Identity/{address}")
+        stake, note = extract_stake_from_result(js.get("result"))
+        return stake, note
     except Exception as e:
         return 0.0, f"stake_fetch_error:{e}"
 
@@ -173,10 +206,12 @@ def main() -> int:
     ap.add_argument("--epoch", type=int, default=0, help="Epoch number. If 0, uses current epoch from /Epoch/Last.")
     ap.add_argument("--threshold", type=int, default=3, help="Count identities with flipCount > threshold (default: 3).")
     ap.add_argument("--page-size", type=int, default=100, help="Pagination page size (limit=). Max is 100.")
-    ap.add_argument("--sleep-per-page", type=float, default=0.1, help="Sleep seconds after each page fetch (default: 0.1).")
-    ap.add_argument("--top", type=int, default=50, help="Print top N authors by flipCount (default: 50).")
-    ap.add_argument("--out-dir", default="./out", help="Output directory (default: ./out).")
-    ap.add_argument("--fetch-stake", action="store_true", help="Also query stake for authors with extra flips (slower).")
+    ap.add_argument("--sleep-per-page", type=float, default=0.1, help="Delay between list pages (sec).")
+    ap.add_argument("--top", type=int, default=50, help="Print top N authors by flipCount to console.")
+    ap.add_argument("--out-dir", default="./out", help="Output directory.")
+    ap.add_argument("--fetch-stake", action="store_true", help="Fetch stake for authors with extra flips (flipCount > threshold).")
+    ap.add_argument("--fetch-stake-all", action="store_true", help="Fetch stake for ALL authors who submitted flips (heavy).")
+    ap.add_argument("--stake-sleep", type=float, default=0.10, help="Sleep between stake calls (sec). Helps avoid rate limits.")
     args = ap.parse_args()
 
     if args.page_size < 1 or args.page_size > MAX_PAGE_SIZE:
@@ -215,16 +250,6 @@ def main() -> int:
     log(f"authors_with_flipCount>{thr}: {authors_gt_n}")
     log(f"total_extra_flips_over_{thr}: {total_extra_flips}")
 
-    # histogram (small)
-    hist = Counter()
-    for c in counts.values():
-        if c >= 10:
-            hist["10+"] += 1
-        else:
-            hist[str(c)] += 1
-    log("flipCount histogram (authors): " + ", ".join([f"{k}={hist[k]}" for k in sorted(hist.keys(), key=lambda x: (999 if x == '10+' else int(x)))]))
-
-    # sort authors by count desc
     ranked = sorted(((a, counts[a]) for a in counts), key=lambda x: (x[1], x[0]), reverse=True)
 
     topn = max(0, int(args.top))
@@ -235,15 +260,39 @@ def main() -> int:
             mark = "  EXTRA" if extra > 0 else ""
             print(f"{i:4d}  flips={c:2d}  extra={extra:2d}  {a}{mark}")
 
-    # CSV for authors with > threshold
     out_dir = args.out_dir
     os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, f"live_extra_flips_epoch{epoch}_gt{thr}.csv")
+
+    # Always write CSV for authors over threshold
+    csv_path_over = os.path.join(out_dir, f"live_extra_flips_epoch{epoch}_gt{thr}.csv")
+
+    # Optional new CSV for all authors with flips + stake
+    csv_path_all = os.path.join(out_dir, f"live_flip_authors_epoch{epoch}.csv")
+
     meta_path = os.path.join(out_dir, f"live_extra_flips_epoch{epoch}_gt{thr}.meta.json")
 
-    rows: List[List[Any]] = []
-    stake_total = 0.0
-    stake_rows = 0
+    # Stake fetching plan
+    do_stake_over = bool(args.fetch_stake)
+    do_stake_all = bool(args.fetch_stake_all)
+
+    if do_stake_all:
+        do_stake_over = False  # avoid double work, we will already cover everyone
+
+    stake_cache: Dict[str, Tuple[float, str]] = {}
+
+    def get_stake_cached(addr: str) -> Tuple[float, str]:
+        if addr in stake_cache:
+            return stake_cache[addr]
+        s, note = fetch_stake_for_address_best_effort(api, addr)
+        stake_cache[addr] = (s, note)
+        if args.stake_sleep > 0:
+            time.sleep(args.stake_sleep)
+        return s, note
+
+    # 1) Write authors over threshold CSV
+    rows_over: List[List[Any]] = []
+    stake_total_over = 0.0
+    stake_rows_over = 0
 
     for a in sorted(authors_gt, key=lambda x: (counts[x], x), reverse=True):
         c = counts[a]
@@ -251,17 +300,17 @@ def main() -> int:
         stake = ""
         extra_per_stake = ""
         stake_note = ""
-        if args.fetch_stake:
-            s, note = fetch_stake_for_address(api, a)
-            stake = f"{s:.8f}"
+
+        if do_stake_over:
+            s, note = get_stake_cached(a)
             stake_note = note
+            stake = f"{s:.8f}"
             if s > 0:
                 extra_per_stake = f"{(extra / s):.12f}"
-                stake_total += s
-                stake_rows += 1
-            else:
-                extra_per_stake = ""
-        rows.append([
+                stake_total_over += s
+                stake_rows_over += 1
+
+        rows_over.append([
             a,
             c,
             extra,
@@ -271,9 +320,42 @@ def main() -> int:
             f"https://scan.idena.io/address/{a}",
         ])
 
-    header = ["address", "flipCount", "extraFlipsOverThreshold", "stake", "extraFlipsPerStake", "stakeNote", "scan_url"]
-    write_csv(csv_path, header=header, rows=rows)
+    write_csv(
+        csv_path_over,
+        header=["address", "flipCount", "extraFlipsOverThreshold", "stake", "extraFlipsPerStake", "stakeNote", "scan_url"],
+        rows=rows_over,
+    )
 
+    # 2) Optionally write all authors stake CSV
+    stake_total_all = 0.0
+    stake_rows_all = 0
+
+    if do_stake_all:
+        log(f"Fetching stake for ALL flip authors: {len(counts)} addresses")
+        rows_all: List[List[Any]] = []
+        for i, (a, c) in enumerate(ranked, start=1):
+            s, note = get_stake_cached(a)
+            if s > 0:
+                stake_total_all += s
+                stake_rows_all += 1
+            rows_all.append([
+                a,
+                c,
+                f"{s:.8f}",
+                note,
+                f"https://scan.idena.io/address/{a}",
+            ])
+            if i % 200 == 0:
+                log(f"stake progress: {i}/{len(counts)}")
+
+        write_csv(
+            csv_path_all,
+            header=["address", "flipCount", "stake", "stakeNote", "scan_url"],
+            rows=rows_all,
+        )
+        log(f"Wrote ALL authors CSV: {csv_path_all}")
+
+    # Meta
     meta = {
         "epoch": epoch,
         "threshold": thr,
@@ -285,24 +367,37 @@ def main() -> int:
             "totalExtraFlips": total_extra_flips,
         },
         "stake": {
-            "enabled": bool(args.fetch_stake),
-            "authorsWithStake>0": stake_rows,
-            "totalStakeOfAuthorsWithExtraFlips": stake_total,
-            "extraFlipsPerTotalStake": (total_extra_flips / stake_total) if (args.fetch_stake and stake_total > 0) else None,
+            "fetchStakeOverThresholdEnabled": bool(do_stake_over),
+            "fetchStakeAllEnabled": bool(do_stake_all),
+            "stakeSleepSeconds": float(args.stake_sleep),
+            "overThreshold": {
+                "authorsWithStake>0": stake_rows_over,
+                "totalStake": stake_total_over,
+                "extraFlipsPerTotalStake": (total_extra_flips / stake_total_over) if (do_stake_over and stake_total_over > 0) else None,
+            },
+            "allAuthors": {
+                "authorsWithStake>0": stake_rows_all,
+                "totalStake": stake_total_all,
+            },
         },
-        "note": "This is a live snapshot. Data can change until flip submission closes. Epoch 177 is not special-cased here because this script is meant for the current epoch.",
+        "note": "Live snapshot. Data can change until flip submission closes.",
     }
+
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
-    log(f"Wrote CSV: {csv_path}")
+    log(f"Wrote CSV (over threshold): {csv_path_over}")
     log(f"Wrote META: {meta_path}")
 
-    if args.fetch_stake and stake_total > 0:
-        log(f"extraFlipsPerTotalStake = {total_extra_flips / stake_total:.12f} (extra flips divided by total stake of those authors)")
+    if do_stake_over and stake_total_over > 0:
+        log(f"extraFlipsPerTotalStake(over-threshold authors) = {total_extra_flips / stake_total_over:.12f}")
+
+    if do_stake_all:
+        log(f"totalStake(all flip authors with stake>0) = {stake_total_all:.8f}")
 
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

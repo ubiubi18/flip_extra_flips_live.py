@@ -108,4 +108,3 @@ python3 flip_extra_flips_live.py --epoch 0 --threshold 3 --page-size 100 --sleep
 * This is live data. Numbers can change until flip submission ends.
 * Stake fetching is best-effort and may not represent "stake at validation time" perfectly. It is still useful as a live approximation for modeling.
 
-If you tell me the exact reward formula you use for "extra flip reward per stake", I can add one more line to the script output that prints your exact predicted value directly.

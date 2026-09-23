@@ -1,5 +1,9 @@
 ## Live Extra Flips Scanner
 
+## Research disclaimer
+
+This is experimental research software. I cannot guarantee its security, correctness, or fitness for any purpose. Use it at your own risk, take responsibility for your decisions, independently verify changes, and stay vigilant.
+
 This script performs a live scan for "extra flips" in the current epoch. It counts how many authors published more than a chosen number of flips (default: 3) and calculates how many "extra flips" exist beyond that threshold. Optionally, it can also fetch stake information for those authors.
 
 It is meant for live monitoring before the next validation session, so you can estimate how big the extra-flip pool is and how it might affect rewards.
